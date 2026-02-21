@@ -1,0 +1,7 @@
+# 7zipupdate — gitignore
+.env
+__pycache__/
+*.pyc
+*.log
+*.7z
+*.bak
