@@ -3,5 +3,8 @@
 __pycache__/
 *.pyc
 *.log
+*.log.gz
 *.7z
 *.bak
+.pytest_cache/
+.mypy_cache/

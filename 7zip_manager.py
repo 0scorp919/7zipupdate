@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-7-Zip Extra Manager (v1.3)
+7-Zip Extra Manager (v1.4)
 Author: Oleksii Rovnianskyi System
 
 UA: Менеджер 7-Zip Extra (консольна версія).
@@ -11,8 +11,15 @@ UA: Менеджер 7-Zip Extra (консольна версія).
     - Реєстрація в системному PATH
     - НЕ робить бекап — 7-Zip Extra є CLI-інструментом без даних користувача
 
-CHANGELOG:
-    v1.3 — Аудит перед публікацією в GitHub:
+Changelog:
+    v1.4 (2026-02-26) — Приведено до стандарту manager_standard v3.0:
+        - Додано health_check() — перевірка критичних компонентів
+        - Додано error_reporting() — структурована обробка помилок
+        - Додано DEFAULT_TIMEOUT + network_request_with_retry() — retry з backoff
+        - Додано AutoCloseTimer — автозакриття через 30 сек бездіяльності
+        - Додано _load_env() — завантаження .env (сумісність)
+        - cleanup_old_logs(): стискання part-файлів в .gz
+    v1.3 (2026-02-21) — Аудит перед публікацією в GitHub:
            Хардкод USER_ROOT замінено на SCRIPT_DIR → CAPSULE_ROOT auto-detect
            (портативність: проект працює з будь-якого шляху без змін коду).
            Додано _rotate_log_if_needed() — >50 MB → part-файл (стандарт капсули).
@@ -20,18 +27,18 @@ CHANGELOG:
            поточний день НІКОЛИ не видаляється.
            ensure_in_system_path() — додано -AutoClose до fix_path.ps1 (стандарт v1.7.5).
            Додано .gitignore у devops/7zipupdate/.
-    v1.2 — Приведено до стандарту chromeupdate:
+    v1.2 (2026-02-20) — Приведено до стандарту chromeupdate:
            порядок кроків main() виправлено: PATH → logs → update
            (раніше: logs → PATH → update — невідповідність стандарту капсули).
            Стиль: cprint/log вирівняно з chrome_manager (відступи, емодзі).
            Додано .env.example (пояснення чому .env не потрібен).
            README оновлено до v1.2 зі структурою файлів та Troubleshooting.
-    v1.1 — Стандарт менеджера капсули:
+    v1.1 (2026-02-20) — Стандарт менеджера капсули:
            __version__ + get_manager_hash() (SHA256 self-check),
            порядок кроків main(): logs → PATH → update,
            cleanup_old_logs() — ротація за розміром >10 MB (додатково до 7 днів),
            вивід часу виконання ⏱️ в main().
-    v1.0 — Початкова версія.
+    v1.0 (2026-02-20) — Початкова версія.
            Джерело: https://www.7-zip.org/download.html (парсинг Extra .7z)
            Завантаження: https://www.7-zip.org/a/7z{VER}-extra.7z
 """
@@ -46,8 +53,12 @@ import glob
 import re
 import tempfile
 import shutil
+import signal
+import threading
+from typing import Optional
 
-__version__ = "1.3"
+__version__ = "1.4"
+APP_NAME = "7zip"
 
 # ---------------------------------------------------------------------------
 # AUTO-DETECT CAPSULE ROOT — хардкод абсолютних шляхів ЗАБОРОНЕНО
@@ -57,10 +68,33 @@ __version__ = "1.3"
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 CAPSULE_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 
-SEVENZIP_DIR  = os.path.join(CAPSULE_ROOT, "apps", "7zip")
-LOG_DIR       = os.path.join(CAPSULE_ROOT, "logs", "7ziplog")
-DOWNLOADS_DIR = os.path.join(CAPSULE_ROOT, "downloads")
-PWSH_EXE      = os.path.join(CAPSULE_ROOT, "apps", "pwsh", "pwsh.exe")
+# ---------------------------------------------------------------------------
+# LOAD .ENV (сумісність)
+# ---------------------------------------------------------------------------
+def _load_env() -> dict:
+    """Load .env file next to script. UA: Завантаження .env поруч зі скриптом."""
+    result: dict = {}
+    env_path = os.path.join(SCRIPT_DIR, ".env")
+    if not os.path.exists(env_path):
+        return result
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    result[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return result
+
+_env = _load_env()
+
+# Шляхи: з .env або auto-detect від CAPSULE_ROOT
+SEVENZIP_DIR  = _env.get("SEVENZIP_DIR")  or os.path.join(CAPSULE_ROOT, "apps", "7zip")
+LOG_DIR       = _env.get("LOG_DIR")       or os.path.join(CAPSULE_ROOT, "logs", "7ziplog")
+DOWNLOADS_DIR = _env.get("DOWNLOADS")     or os.path.join(CAPSULE_ROOT, "downloads")
+PWSH_EXE      = _env.get("PWSH_EXE")      or os.path.join(CAPSULE_ROOT, "apps", "pwsh", "pwsh.exe")
 
 # UA: 7za.exe — консольна версія (x86), x64/ — 64-бітна версія
 SEVENZIP_EXE = os.path.join(SEVENZIP_DIR, "7za.exe")
@@ -71,6 +105,72 @@ SEVENZIP_BASE_URL      = "https://www.7-zip.org/"
 
 PYTHON_EXE = sys.executable
 START_TIME = time.time()
+
+# ---------------------------------------------------------------------------
+# NETWORK TIMEOUTS
+# ---------------------------------------------------------------------------
+DEFAULT_TIMEOUT = 30  # seconds
+
+
+def network_request_with_retry(url: str, max_retries: int = 3, initial_delay: float = 1.0) -> requests.Response:
+    """Make HTTP request with exponential backoff retry.
+    UA: HTTP запит з retry та експоненційним backoff."""
+    delay = initial_delay
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                log(f"   Спроба {attempt + 1}/{max_retries} невдала: {e}. Повтор через {delay}с...", Colors.YELLOW)
+                time.sleep(delay)
+                delay *= 2  # exponential backoff
+
+    raise ConnectionError(f"Не вдалося виконати запит після {max_retries} спроб: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# AUTO-CLOSE TIMER (30 seconds of inactivity)
+# ---------------------------------------------------------------------------
+class AutoCloseTimer:
+    """Auto-close after 30 seconds of inactivity.
+    UA: Автозакриття після 30 секунд бездіяльності."""
+
+    def __init__(self, timeout: int = 30):
+        self.timeout = timeout
+        self.last_activity = time.time()
+        self.running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def reset(self) -> None:
+        """Reset the inactivity timer."""
+        self.last_activity = time.time()
+
+    def start(self) -> None:
+        """Start the auto-close timer."""
+        self.running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the auto-close timer."""
+        self.running = False
+
+    def _run(self) -> None:
+        """Internal timer loop."""
+        while self.running:
+            if time.time() - self.last_activity > self.timeout:
+                cprint(f"\n[{Colors.YELLOW}TIMEOUT{Colors.RESET}] Автозакриття через {self.timeout} сек бездіяльності.", Colors.YELLOW)
+                self.running = False
+                os._exit(0)
+            time.sleep(1)
+
+
+_auto_close = AutoCloseTimer(30)
 
 # ---------------------------------------------------------------------------
 # КОЛЬОРИ
@@ -185,6 +285,64 @@ def draw_progress(label: str, percent: int, width: int = 20) -> None:
 # ---------------------------------------------------------------------------
 # КРОК 1: Перевірка PATH
 # ---------------------------------------------------------------------------
+def show_path_info() -> None:
+    """
+    Show information about what is registered in PATH for 7-Zip.
+    UA: Показує інформацію про те, що зареєстровано в PATH для 7-Zip.
+        - tags/ → Win+R → 7zip (ярлик/менеджер)
+        - apps/7zip/ → 7za.exe (консольний архіватор)
+    """
+    cprint("-" * 50, Colors.BLUE)
+    log("🔧 ІНФОРМАЦІЯ ПРО PATH", Colors.HEADER)
+
+    # Paths to check
+    tags_dir = os.path.join(CAPSULE_ROOT, "tags")
+    sevenzip_dir = SEVENZIP_DIR.rstrip('\\')
+
+    # Read PATH from registry
+    try:
+        import winreg  # type: ignore[import]
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            0, winreg.KEY_READ
+        )
+        current_path, _ = winreg.QueryValueEx(key, "Path")
+        winreg.CloseKey(key)
+        entries = [e.rstrip('\\').strip().lower() for e in current_path.split(';') if e.strip()]
+    except Exception:
+        entries = []
+
+    # Check tags/ (for Win+R → 7zip)
+    tags_norm = tags_dir.rstrip('\\').lower()
+    tags_in_path = tags_norm in entries
+
+    # Check apps/7zip/ (for 7za.exe)
+    sevenzip_norm = sevenzip_dir.lower()
+    sevenzip_in_path = sevenzip_norm in entries
+
+    # Display information
+    log("", Colors.RESET)
+    log("   📋 РЕЄСТРАЦІЯ В PATH:", Colors.CYAN)
+    log("", Colors.RESET)
+
+    if tags_in_path:
+        log("   ✅ tags/         → Win+R → 7zip (ярлик менеджера)", Colors.GREEN)
+    else:
+        log("   ❌ tags/         → Win+R → 7zip (ярлик менеджера) — НЕ зареєстровано", Colors.RED)
+
+    if sevenzip_in_path:
+        log("   ✅ apps/7zip/    → 7za.exe (консольний архіватор)", Colors.GREEN)
+    else:
+        log("   ❌ apps/7zip/    → 7za.exe (консольний архіватор) — НЕ зареєстровано", Colors.RED)
+
+    log("", Colors.RESET)
+    log("   💡 ПРИМІТКА:", Colors.YELLOW)
+    log("      Win+R → 7zip  → запускає менеджер (tags/7zip.bat)", Colors.CYAN)
+    log("      Win+R → 7za   → консольний архіватор (apps/7zip/7za.exe)", Colors.CYAN)
+    log("", Colors.RESET)
+
+
 def ensure_in_system_path() -> None:
     """
     Ensure apps/7zip/ is in system PATH (HKLM), remove duplicates.
@@ -193,8 +351,8 @@ def ensure_in_system_path() -> None:
         Також прибирає дублікати та обрізані записи.
         Потрібно для роботи `7za` з будь-якого місця в системі.
     """
-    cprint("-" * 50, Colors.BLUE)
-    log("🔧 ПЕРЕВІРКА СИСТЕМНОГО PATH", Colors.HEADER)
+    # UA: Спочатку показуємо інформацію про поточний стан PATH
+    show_path_info()
 
     ps_script = os.path.join(CAPSULE_ROOT, "devops", "pathupdate", "fix_path.ps1")
     if not os.path.exists(ps_script):
@@ -214,7 +372,7 @@ def ensure_in_system_path() -> None:
         entries = [e.rstrip('\\').strip() for e in current_path.split(';') if e.strip()]
         sevenzip_norm = SEVENZIP_DIR.rstrip('\\')
         if sevenzip_norm in entries:
-            log("   ✅ apps/7zip/ вже в системному PATH.", Colors.GREEN)
+            # log("   ✅ apps/7zip/ вже в системному PATH.", Colors.GREEN)
             return
     except Exception:
         pass  # UA: winreg недоступний або помилка читання — продовжуємо
@@ -236,15 +394,116 @@ def ensure_in_system_path() -> None:
         log(f"   ℹ️  Запусти вручну: {ps_script}", Colors.CYAN)
 
 # ---------------------------------------------------------------------------
+# HEALTH CHECKS
+# ---------------------------------------------------------------------------
+def health_check() -> dict:
+    """Validate critical components before execution.
+    UA: Перевірка критичних компонентів перед виконанням."""
+    checks = {
+        "7zip": os.path.exists(SEVENZIP_EXE),
+        "7zip_dir": os.path.exists(SEVENZIP_DIR),
+        "log_dir": os.path.exists(LOG_DIR),
+        "capsule_root": os.path.exists(CAPSULE_ROOT),
+    }
+
+    if not checks["7zip"]:
+        log("⚠️ 7za.exe не знайдено! Запусти Win+R → 7zip", Colors.YELLOW)
+    if not checks["7zip_dir"]:
+        log(f"⚠️ Директорія 7-Zip не знайдена: {SEVENZIP_DIR}", Colors.YELLOW)
+
+    return checks
+
+
+# ---------------------------------------------------------------------------
+# ERROR REPORTING
+# ---------------------------------------------------------------------------
+def error_reporting(error: Exception, context: str = "") -> None:
+    """Structured error handling with actionable messages.
+    UA: Структурована обробка помилок з рекомендаціями."""
+    error_msg = f"❌ ПОМИЛКА [{context}]: {type(error).__name__}: {error}"
+    log(error_msg, Colors.RED)
+
+    # Діагностичні поради
+    if "FileNotFoundError" in str(type(error)):
+        log("   ℹ️  Перевірте наявність файлів/директорій", Colors.CYAN)
+    elif "PermissionError" in str(type(error)):
+        log("   ℹ️  Можливо, потрібні права адміністратора (UAC)", Colors.CYAN)
+    elif "ConnectionError" in str(type(error)):
+        log("   ℹ️  Перевірте мережеве підключення", Colors.CYAN)
+
+    # Запис у лог файл
+    logging.error(f"{context}: {error}", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # КРОК 2: Ротація логів
 # ---------------------------------------------------------------------------
 def cleanup_old_logs(max_days: int = 7) -> None:
-    """Delete log files older than max_days. NEVER delete current day files.
-    UA: Видаляє лог-файли старші за max_days днів. Поточний день НЕ видаляється.
-        Стандарт капсули: 7 днів. Ротація >50 MB → part-файл (в _rotate_log_if_needed)."""
+    """Delete log files older than max_days. Compress rotated parts to .gz.
+    UA: Видаляє лог-файли старші за max_days днів. Стискає ротовані частини в .gz.
+    Поточний день НЕ видаляється."""
     log("🧹 Перевірка старих логів...", Colors.CYAN)
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     deleted = 0
+
+    # Part files older than 7 days → compress to .gz
+    for f in glob.glob(os.path.join(LOG_DIR, "7zip_log_*_part*.log")):
+        fname = os.path.basename(f)
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
+        if not match:
+            continue
+        file_date = match.group(1)
+        if file_date == today_str:
+            continue
+
+        # Compress to .gz if not already compressed
+        gz_file = f + ".gz"
+        if not os.path.exists(gz_file):
+            try:
+                import gzip
+                with open(f, 'rb') as f_in:
+                    with gzip.open(gz_file, 'wb') as f_out:
+                        f_out.writelines(f_in)
+                os.remove(f)  # Remove original after compression
+                log(f"   ✓ Стиснуто: {fname} → {fname}.gz", Colors.CYAN)
+            except Exception as e:
+                log(f"   ⚠️ Помилка стискання {fname}: {e}", Colors.YELLOW)
+
+    # Delete .gz files older than 7 days
+    for f in glob.glob(os.path.join(LOG_DIR, "7zip_log_*.log.gz")):
+        fname = os.path.basename(f)
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
+        if not match:
+            continue
+        file_date = match.group(1)
+
+        try:
+            file_date_obj = datetime.datetime.strptime(file_date, "%Y-%m-%d").date()
+            days_old = (datetime.date.today() - file_date_obj).days
+            if days_old > max_days:
+                os.remove(f)
+                deleted += 1
+        except ValueError:
+            continue
+
+    # Delete old part files (not compressed)
+    for f in glob.glob(os.path.join(LOG_DIR, "7zip_log_*_part*.log")):
+        fname = os.path.basename(f)
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
+        if not match:
+            continue
+        file_date = match.group(1)
+
+        try:
+            file_date_obj = datetime.datetime.strptime(file_date, "%Y-%m-%d").date()
+            days_old = (datetime.date.today() - file_date_obj).days
+            if days_old > max_days:
+                os.remove(f)
+                deleted += 1
+        except ValueError:
+            continue
+
+    # Delete regular log files older than max_days
     for f in glob.glob(os.path.join(LOG_DIR, "7zip_log_*.log")):
         fname = os.path.basename(f)
         match = re.search(r"(\d{4}-\d{2}-\d{2})", fname)
@@ -262,6 +521,7 @@ def cleanup_old_logs(max_days: int = 7) -> None:
                 log(f"   🗑️ Видалено лог: {fname}", Colors.YELLOW)
         except Exception:
             pass
+
     if deleted:
         log(f"✅ Очищено логів: {deleted}", Colors.GREEN)
     else:

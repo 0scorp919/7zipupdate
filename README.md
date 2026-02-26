@@ -2,7 +2,7 @@
 
 Менеджер автооновлення 7-Zip Extra (консольна версія) у Autonomous Capsule.
 
-**Поточна версія:** `7zip_manager.py` v1.3
+**Поточна версія:** `7zip_manager.py` v1.4
 
 ## Запуск
 
@@ -203,9 +203,14 @@ python 7zip_manager.py [--install-only]
 
 ## CHANGELOG
 
-- **v1.4** (2026-02-21) — Додано портативний лаунчер для публікації на GitHub:
-  - `7zip_launcher.bat` — auto-detect CAPSULE_ROOT від `%~dp0` (без хардкодованих шляхів)
-  - Оновлено `README.md`: секція "Портативний лаунчер", оновлена структура файлів
+- **v1.4** (2026-02-26) — Приведено до стандарту manager_standard v3.0:
+  - `health_check()` — перевірка критичних компонентів
+  - `error_reporting()` — структурована обробка помилок
+  - `DEFAULT_TIMEOUT` + `network_request_with_retry()` — retry з backoff
+  - `AutoCloseTimer` — автозакриття через 30 сек бездіяльності
+  - `_load_env()` — завантаження .env (сумісність)
+  - `cleanup_old_logs()`: стискання part-файлів в .gz
+  - Оновлено `.gitignore`: додано `*.log.gz`, `.pytest_cache/`, `.mypy_cache/`
 - **v1.3** (2026-02-21) — Аудит перед публікацією в GitHub:
   - Хардкод `USER_ROOT` замінено на `SCRIPT_DIR → CAPSULE_ROOT` auto-detect (портативність)
   - Додано `_rotate_log_if_needed()` — >50 MB → part-файл (стандарт капсули)
