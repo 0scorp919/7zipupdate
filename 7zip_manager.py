@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
-7-Zip Extra Manager (v1.4)
+7-Zip Extra Manager (v1.4.1)
 Author: Oleksii Rovnianskyi System
 
 UA: Менеджер 7-Zip Extra (консольна версія).
@@ -12,7 +12,7 @@ UA: Менеджер 7-Zip Extra (консольна версія).
     - НЕ робить бекап — 7-Zip Extra є CLI-інструментом без даних користувача
 
 Changelog:
-    v1.4 (2026-02-26) — Приведено до стандарту manager_standard v3.0:
+    v1.4.1 (2026-02-26) — Виправлено застарілий хардкод: tags/7zip.bat → tags/7zip.lnk (Windows ярлик). — Приведено до стандарту manager_standard v3.0:
         - Додано health_check() — перевірка критичних компонентів
         - Додано error_reporting() — структурована обробка помилок
         - Додано DEFAULT_TIMEOUT + network_request_with_retry() — retry з backoff
@@ -57,7 +57,7 @@ import signal
 import threading
 from typing import Optional
 
-__version__ = "1.4"
+__version__ = "1.4.1"
 APP_NAME = "7zip"
 
 # ---------------------------------------------------------------------------
@@ -338,7 +338,7 @@ def show_path_info() -> None:
 
     log("", Colors.RESET)
     log("   💡 ПРИМІТКА:", Colors.YELLOW)
-    log("      Win+R → 7zip  → запускає менеджер (tags/7zip.bat)", Colors.CYAN)
+    log("      Win+R → 7zip  → запускає менеджер (tags/7zip.lnk)", Colors.CYAN)
     log("      Win+R → 7za   → консольний архіватор (apps/7zip/7za.exe)", Colors.CYAN)
     log("", Colors.RESET)
 
