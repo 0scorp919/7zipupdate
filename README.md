@@ -229,7 +229,7 @@ python 7zip_manager.py [--install-only]
   - `DEFAULT_TIMEOUT` + `network_request_with_retry()` — retry з backoff
   - `AutoCloseTimer` — автозакриття через 30 сек бездіяльності
   - `_load_env()` — завантаження .env (сумісність)
-  - `cleanup_old_logs()`: стискання part-файлів в .gz
+  - `cleanup_old_logs()` — видалення старих логів (7 днів)
   - Оновлено `.gitignore`: додано `*.log.gz`, `.pytest_cache/`, `.mypy_cache/`
 - **v1.3** (2026-02-21) — Аудит перед публікацією в GitHub:
   - Хардкод `USER_ROOT` замінено на `SCRIPT_DIR → CAPSULE_ROOT` auto-detect (портативність)
